@@ -1,0 +1,20 @@
+# Real config with secrets — never commit
+CoderAgentConfig.yaml
+
+# Actual prompts — never commit
+prompt.md
+
+# Agent logs
+logs/
+
+# Agent scratchpad (inter-iteration notes)
+agent_scratchpad.md
+
+# Agent done signal
+.agent_done
+
+# Internal commit logs
+InternalLogs/
+
+__pycache__/
+*.pyc
