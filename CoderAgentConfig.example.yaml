@@ -3,13 +3,23 @@
 # Copy this file to CoderAgentConfig.yaml and fill in your values.
 # CoderAgentConfig.yaml is git-ignored so your token stays local.
 #
-# IMPORTANT: Classic PATs (ghp_) are NOT supported by the Copilot CLI.
-# You MUST use a Fine-Grained Personal Access Token (github_pat_).
+# ──────────────────────────────────────────────────────────────────
+# REQUIRED
+# ──────────────────────────────────────────────────────────────────
 #
-# Generate one at:
-#   https://github.com/settings/personal-access-tokens/new
+# github_token
+#   Your GitHub Fine-Grained Personal Access Token.
 #
-# Required permissions:
-#   Account permissions → GitHub Copilot → Read-only
+#   IMPORTANT: Classic PATs (ghp_…) are NOT supported.
+#   You MUST use a Fine-Grained PAT (github_pat_…).
+#
+#   How to generate one:
+#     1. Go to https://github.com/settings/personal-access-tokens/new
+#     2. Give it a name, e.g. "CoderAgent"
+#     3. Set an expiration date
+#     4. Under "Account permissions" enable:
+#          GitHub Copilot → Read-only
+#     5. Click "Generate token" and paste it below
 
 github_token: XXXXXXXXXXXXXXXXXX
+

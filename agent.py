@@ -1,30 +1,42 @@
 #!/usr/bin/env python3
 """
-agent.py - Run a GitHub Copilot CLI coding agent in a loop
+agent.py — GitHub Copilot SDK coding agent loop
 
-Reads a task prompt from a Markdown file and repeatedly invokes the Copilot CLI
-to execute it.  The agent logs every prompt and response, tracks git commits,
-and loops until the user presses Ctrl-C (or a maximum iteration count is hit).
+Drives the GitHub Copilot SDK Python client in an iterative loop.
+Each iteration:
+  1. Re-reads your task prompt (editable while running).
+  2. Sends it to a fresh Copilot SDK session with streaming output.
+  3. Waits for the model to finish (SessionIdle event).
+  4. Checks git commits and logs changes.
+  5. Waits --delay seconds, then repeats.
+
+Custom tools registered with the agent every session:
+  analyze_image — Submit an image file path + question; returns vision analysis.
 
 Usage:
     python agent.py --prompt prompt.md
     python agent.py --prompt prompt.md --max-iterations 10
     python agent.py --prompt prompt.md --dir ../MyProject --dir ../Shared
     python agent.py --prompt prompt.md --delay 15 --model claude-opus-4.6
+    python agent.py --prompt prompt.md --image screenshot.png
     python agent.py --prompt prompt.md --once
+    python agent.py --prompt prompt.md --dry-run
 
 Prerequisites:
-    - GitHub CLI installed with Copilot extension (`gh copilot` on PATH)
+    - Python 3.10+
+    - github-copilot-sdk  (auto-installed by setup.py)
+    - A GitHub fine-grained PAT with Copilot → Read-only permission
 """
 
+import asyncio
 import subprocess
 import sys
 import os
 import time
 import shutil
 import argparse
-import select
-import threading
+import base64
+import mimetypes
 from pathlib import Path
 from datetime import datetime
 
@@ -34,10 +46,9 @@ from setup import run_setup
 # Defaults
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL = "claude-opus-4.6"
-DEFAULT_DELAY = 30  # seconds between iterations
-DEFAULT_IDLE_TIMEOUT = 300  # kill if no output for 5 minutes
+DEFAULT_DELAY = 30           # seconds between iterations
 DEFAULT_ITERATION_TIMEOUT = 3600  # kill after 60 minutes total per iteration
-DONE_SIGNAL_FILE = ".agent_done"  # agent creates this file to end early
+DONE_SIGNAL_FILE = ".agent_done"  # agent creates this file to signal completion
 
 # Force UTF-8 on Windows
 if sys.platform == "win32":
@@ -307,25 +318,31 @@ def check_done_signal(work_dir: Path) -> bool:
     return False
 
 
-def build_full_prompt(user_prompt: str, iteration: int,
-                      scratchpad: str) -> str:
-    """Wrap the user prompt with scratchpad contents and housekeeping."""
-    scratchpad_section = ""
+def build_full_prompt(user_prompt: str, iteration: int, scratchpad: str,
+                      work_dir: Path, extra_dirs: list[Path]) -> str:
+    """Wrap the user prompt with directory context, scratchpad, and housekeeping."""
     if scratchpad.strip():
         scratchpad_section = (
             "\n---\n\n"
-            "## Scratchpad (notes from your previous iteration)\n\n"
+            "## Scratchpad (your notes from the previous iteration)\n\n"
             f"{scratchpad}\n"
         )
     else:
         scratchpad_section = (
             "\n---\n\n"
             "## Scratchpad\n\n"
-            "*(empty — this is the first iteration, or no notes were saved)*\n"
+            "*(empty — first iteration, or no notes were saved)*\n"
         )
+
+    dirs_info = f"Primary working directory: `{work_dir}`\n"
+    if extra_dirs:
+        dirs_info += "Additional directories available:\n"
+        for d in extra_dirs:
+            dirs_info += f"  - `{d}`\n"
 
     return f"""## Iteration {iteration}
 
+{dirs_info}
 {user_prompt}
 {scratchpad_section}
 ---
@@ -341,8 +358,8 @@ def build_full_prompt(user_prompt: str, iteration: int,
    unrelated code or add features that were not requested.
 4. **Stop when done.** When the task is fully complete and there is nothing left
    to do, create an empty file called `.agent_done` in the working directory
-   (e.g. run `touch .agent_done` or write an empty file).  This signals the
-   outer loop to stop iterating.  You should still commit your work first.
+   (e.g. `touch .agent_done`).  This signals the outer loop to stop.  Commit
+   your work first.
 5. **Update the scratchpad.** Before stopping, write notes to
    `agent_scratchpad.md` in the working directory.  Include:
    - What you accomplished this iteration
@@ -350,178 +367,335 @@ def build_full_prompt(user_prompt: str, iteration: int,
    - Any problems, blockers, or decisions for the next iteration
    - Key file paths or context the next iteration will need
    Do NOT commit this file — it is git-ignored.
+6. **Analyze images when needed.** Use the `analyze_image` tool to examine any
+   image file.  Pass the file path and a specific question about the image.
 """
 
 
 # ---------------------------------------------------------------------------
-# Copilot invocation
+# Custom tools
 # ---------------------------------------------------------------------------
 
-def run_copilot(prompt: str, *, copilot_cli: str, model: str,
-                work_dir: Path, extra_dirs: list[Path],
-                iteration: int,
-                idle_timeout: int = DEFAULT_IDLE_TIMEOUT,
-                iteration_timeout: int = DEFAULT_ITERATION_TIMEOUT) -> int:
-    """Invoke the Copilot CLI with the given prompt.
+def _build_custom_tools(github_token: str, model: str) -> list:
+    """Build and return the list of custom tools to register with each session.
 
-    Returns the process exit code.
+    Tools are created fresh each call so closures over github_token/model
+    are always current.
 
-    Protections against hanging:
-      - stdin is /dev/null so the agent can never block on user input
-      - idle_timeout kills the process if no output for N seconds
-      - iteration_timeout kills the process after N seconds total
+    Available custom tools
+    ----------------------
+    analyze_image
+        Analyze an image file (JPEG, PNG, GIF, WebP, BMP, …) using vision AI.
+        The agent passes an image path and a specific question; the tool spins
+        up a short-lived Copilot session with the image attached and returns
+        a text answer.  This lets the agent examine diagrams, screenshots,
+        UI mockups, or any other visual artifact in the working directory
+        without leaving its current session.
     """
-    # Write the prompt to a temp file to avoid command-line length limits
-    prompt_dir = work_dir / "logs"
-    prompt_dir.mkdir(parents=True, exist_ok=True)
-    prompt_file = prompt_dir / f"prompt_iter{iteration}.md"
-    prompt_file.write_text(prompt, encoding="utf-8")
-
-    short_prompt = (
-        f"Read and follow ALL instructions in the file: {prompt_file}\n"
-        f"That file contains your complete task description."
+    # Deferred imports — SDK may not be installed until setup.py runs
+    from copilot import CopilotClient, SubprocessConfig, define_tool  # noqa: F401
+    from copilot.session import PermissionHandler
+    from copilot.generated.session_events import (
+        AssistantMessageData,
+        SessionIdleData,
     )
+    from pydantic import BaseModel, Field
 
-    cmd = [
-        copilot_cli, "copilot",
-        "--",
-        "--model", model,
-        "--allow-all-tools",
-        "--allow-all-paths",
-        "-p", short_prompt,
-        "--add-dir", str(work_dir),
-    ]
-    for d in extra_dirs:
-        if d.exists():
-            cmd.extend(["--add-dir", str(d)])
+    class AnalyzeImageParams(BaseModel):
+        image_path: str = Field(
+            description=(
+                "Path to the image file to analyze.  "
+                "Can be absolute or relative to the working directory."
+            )
+        )
+        question: str = Field(
+            description="Specific question to answer about the image contents."
+        )
 
-    log_section(f"PROMPT (iteration {iteration})", prompt)
+    @define_tool(
+        description=(
+            "Analyze an image file using vision AI and answer a specific question "
+            "about it.  Supports JPEG, PNG, GIF, WebP, BMP and other common "
+            "image formats.  Returns a detailed text answer."
+        )
+    )
+    async def analyze_image(params: AnalyzeImageParams) -> str:
+        path = Path(params.image_path)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.exists():
+            return f"Error: image file not found: {params.image_path}"
+
+        try:
+            image_bytes = path.read_bytes()
+            image_data = base64.b64encode(image_bytes).decode("utf-8")
+        except OSError as exc:
+            return f"Error reading image: {exc}"
+
+        mime_type, _ = mimetypes.guess_type(str(path))
+        if not mime_type or not mime_type.startswith("image/"):
+            mime_type = "image/jpeg"
+
+        try:
+            async with CopilotClient(
+                SubprocessConfig(github_token=github_token)
+            ) as vision_client:
+                async with await vision_client.create_session(
+                    on_permission_request=PermissionHandler.approve_all,
+                    model=model,
+                ) as vision_session:
+                    done_evt = asyncio.Event()
+                    result_parts: list[str] = []
+
+                    def on_vision_event(event):
+                        match event.data:
+                            case AssistantMessageData() as data:
+                                result_parts.append(data.content)
+                            case SessionIdleData():
+                                done_evt.set()
+
+                    vision_session.on(on_vision_event)
+                    await vision_session.send(
+                        params.question,
+                        attachments=[{
+                            "type": "blob",
+                            "data": image_data,
+                            "mimeType": mime_type,
+                        }],
+                    )
+                    try:
+                        await asyncio.wait_for(done_evt.wait(), timeout=120)
+                    except asyncio.TimeoutError:
+                        return "Vision analysis timed out after 120 s."
+
+                    return result_parts[0] if result_parts else "(no analysis returned)"
+        except asyncio.TimeoutError:
+            return "Vision analysis timed out."
+        except (OSError, ValueError) as exc:
+            return f"Error during vision analysis: {exc}"
+        except asyncio.CancelledError:
+            raise
+
+    return [analyze_image]
+
+
+# ---------------------------------------------------------------------------
+# SDK agent session
+# ---------------------------------------------------------------------------
+
+async def run_agent(
+    prompt: str,
+    *,
+    github_token: str,
+    model: str,
+    work_dir: Path,
+    iteration: int,
+    image_paths: list[Path],
+    iteration_timeout: int = DEFAULT_ITERATION_TIMEOUT,
+) -> bool:
+    """Run one agent iteration using the Copilot SDK.
+
+    Opens a fresh CopilotClient + session, streams output to the terminal and
+    the log file, then waits for the SessionIdle event (model finished) or the
+    iteration timeout.
+
+    Returns True on successful completion, False on timeout or error.
+    """
+    # Deferred SDK imports
+    from copilot import CopilotClient, SubprocessConfig
+    from copilot.session import PermissionHandler, PermissionRequestResult  # noqa: F401
+    from copilot.generated.session_events import (
+        AssistantMessageData,
+        AssistantMessageDeltaData,
+        AssistantReasoningData,
+        AssistantReasoningDeltaData,
+        SessionIdleData,
+    )
 
     print()
     print("=" * 60)
-    print(f"  Iteration {iteration}")
+    print(f"  Iteration {iteration}  |  model: {model}")
     print("=" * 60)
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(work_dir),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
+    log_section(f"PROMPT (iteration {iteration})", prompt)
 
-        output_lines = []
-        iteration_start = time.monotonic()
-        last_output_time = time.monotonic()
-        timed_out = False
-        timeout_reason = ""
-
-        def _read_output():
-            """Read stdout in a background thread to allow timeout checks."""
-            nonlocal last_output_time
-            try:
-                for line in proc.stdout:
-                    output_lines.append(line)
-                    last_output_time = time.monotonic()
-                    print(line, end="")
-                    log(line.rstrip())
-            except ValueError:
-                pass  # stdout closed
-
-        reader = threading.Thread(target=_read_output, daemon=True)
-        reader.start()
-
+    # ------------------------------------------------------------------
+    # Build image attachments from --image flags
+    # ------------------------------------------------------------------
+    attachments: list[dict] = []
+    for img_path in image_paths:
+        if not img_path.exists():
+            print(f"  WARNING: Image not found, skipping: {img_path}", flush=True)
+            log(f"WARNING: Image not found: {img_path}")
+            continue
         try:
-            while reader.is_alive():
-                reader.join(timeout=5)
-                now = time.monotonic()
+            image_data = base64.b64encode(img_path.read_bytes()).decode("utf-8")
+            mime_type, _ = mimetypes.guess_type(str(img_path))
+            if not mime_type or not mime_type.startswith("image/"):
+                mime_type = "image/jpeg"
+            attachments.append({
+                "type": "blob",
+                "data": image_data,
+                "mimeType": mime_type,
+            })
+            print(f"  Attached image: {img_path.name}", flush=True)
+            log(f"Attached image: {img_path}")
+        except OSError as exc:
+            print(f"  WARNING: Could not read {img_path.name}: {exc}", flush=True)
+            log(f"WARNING: Could not read image {img_path}: {exc}")
 
-                # Check idle timeout
-                if idle_timeout > 0 and (now - last_output_time) > idle_timeout:
-                    timed_out = True
-                    timeout_reason = (
-                        f"No output for {idle_timeout}s (idle timeout)"
+    # ------------------------------------------------------------------
+    # Permission handler — approve all, with terminal + log output
+    # ------------------------------------------------------------------
+    def on_permission(request, invocation) -> "PermissionRequestResult":
+        kind = getattr(request.kind, "value", str(request.kind))
+        if kind == "shell":
+            cmd_text = getattr(request, "full_command_text", "")
+            log(f"[TOOL] shell: {cmd_text}")
+            print(f"\n  ▶ shell: {cmd_text}", flush=True)
+        elif kind == "write":
+            fname = getattr(request, "file_name", "")
+            log(f"[TOOL] write: {fname}")
+            print(f"\n  ▶ write: {fname}", flush=True)
+        elif kind == "custom-tool":
+            tool_name = getattr(request, "tool_name", "")
+            log(f"[TOOL] custom: {tool_name}")
+            print(f"\n  ▶ tool: {tool_name}", flush=True)
+        elif kind not in ("read", "memory"):
+            log(f"[TOOL] {kind}")
+        return PermissionRequestResult(kind="approved")
+
+    # ------------------------------------------------------------------
+    # User-input handler — relay agent questions to the terminal
+    # ------------------------------------------------------------------
+    async def on_user_input(request, invocation) -> dict:
+        question = request.get("question", "")
+        choices = request.get("choices")
+        log(f"[AGENT QUESTION] {question}")
+        print(f"\n  Agent asks: {question}", flush=True)
+        if choices:
+            for idx, choice in enumerate(choices, 1):
+                print(f"    {idx}. {choice}")
+        try:
+            loop = asyncio.get_running_loop()
+            answer = await loop.run_in_executor(
+                None, lambda: input("  Your answer: ")
+            )
+            return {"answer": answer.strip(), "wasFreeform": True}
+        except (EOFError, KeyboardInterrupt):
+            return {"answer": "", "wasFreeform": True}
+
+    # ------------------------------------------------------------------
+    # Event handler — stream output to terminal and log
+    # ------------------------------------------------------------------
+    output_parts: list[str] = []
+    done_event = asyncio.Event()
+
+    def on_event(event) -> None:
+        match event.data:
+            case AssistantMessageDeltaData() as data:
+                delta = data.delta_content or ""
+                if delta:
+                    print(delta, end="", flush=True)
+                    output_parts.append(delta)
+                    log(delta)
+            case AssistantReasoningDeltaData() as data:
+                delta = data.delta_content or ""
+                if delta:
+                    log(f"[REASONING] {delta}")
+            case AssistantMessageData() as data:
+                # Final full message — only print if streaming gave us nothing
+                if not output_parts:
+                    print(data.content, flush=True)
+                    log(data.content)
+            case AssistantReasoningData():
+                pass  # reasoning already captured via delta events
+            case SessionIdleData():
+                done_event.set()
+
+    # ------------------------------------------------------------------
+    # Custom tools
+    # ------------------------------------------------------------------
+    custom_tools = _build_custom_tools(github_token=github_token, model=model)
+
+    # ------------------------------------------------------------------
+    # Run the session
+    # ------------------------------------------------------------------
+    config = SubprocessConfig(
+        github_token=github_token,
+        cwd=str(work_dir),
+    )
+
+    try:
+        async with CopilotClient(config) as client:
+            create_kwargs: dict = dict(
+                on_permission_request=on_permission,
+                on_user_input_request=on_user_input,
+                model=model,
+                tools=custom_tools,
+                streaming=True,
+            )
+            async with await client.create_session(**create_kwargs) as session:
+                session.on(on_event)
+
+                send_kwargs: dict = {}
+                if attachments:
+                    send_kwargs["attachments"] = attachments
+
+                await session.send(prompt, **send_kwargs)
+
+                try:
+                    await asyncio.wait_for(done_event.wait(), timeout=iteration_timeout)
+                except asyncio.TimeoutError:
+                    msg = (
+                        f"\nTIMEOUT: Iteration {iteration} exceeded "
+                        f"{iteration_timeout}s — aborting."
                     )
-                    break
+                    print(msg, flush=True)
+                    log(msg)
+                    return False
 
-                # Check iteration timeout
-                if iteration_timeout > 0 and (now - iteration_start) > iteration_timeout:
-                    timed_out = True
-                    timeout_reason = (
-                        f"Iteration exceeded {iteration_timeout}s (iteration timeout)"
-                    )
-                    break
+        log_section(f"OUTPUT (iteration {iteration})", "".join(output_parts))
+        return True
 
-        except KeyboardInterrupt:
-            print("\n\nTerminating Copilot subprocess...")
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            raise
-
-        if timed_out:
-            msg = f"TIMEOUT: {timeout_reason} — killing iteration {iteration}"
-            print(f"\n{msg}")
-            log(msg)
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            reader.join(timeout=5)
-        else:
-            proc.wait()
-
-        output = "".join(output_lines)
-        log_section(f"OUTPUT (iteration {iteration})", output)
-
-        if timed_out:
-            return 1
-
-        if proc.returncode != 0:
-            msg = f"Copilot CLI exited with code {proc.returncode}"
-            print(f"\n{msg}")
-            log(msg)
-
-        return proc.returncode
-
-    except FileNotFoundError:
-        print("ERROR: 'gh' CLI not found. Is it installed and on PATH?",
-              file=sys.stderr)
-        log("ERROR: gh CLI not found")
-        return 1
-    except Exception as e:
-        print(f"ERROR running Copilot: {e}", file=sys.stderr)
-        log(f"ERROR: {e}")
-        return 1
+    except KeyboardInterrupt:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except (OSError, RuntimeError, ConnectionError) as exc:
+        print(f"\nERROR in agent session: {exc}", file=sys.stderr, flush=True)
+        log(f"ERROR: {exc}")
+        return False
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Main async loop
 # ---------------------------------------------------------------------------
 
-def main():
+async def async_main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run a Copilot coding agent in a loop",
+        description="Run a GitHub Copilot SDK coding agent in a loop",
     )
     parser.add_argument(
-        "--prompt", required=True, type=str, metavar="FILE",
+        "--prompt", required=True, metavar="FILE",
         help="Path to the Markdown file containing the task prompt",
     )
     parser.add_argument(
         "--dir", action="append", default=[], metavar="PATH",
-        help="Additional directory to expose to the agent (repeatable). "
-             "The first --dir is also used as the working directory. "
-             "If omitted the current directory is used.",
+        help=(
+            "Working directory for the agent (repeatable). "
+            "The first --dir is the primary working directory; "
+            "additional --dir values are mentioned in the prompt. "
+            "Defaults to the current directory."
+        ),
+    )
+    parser.add_argument(
+        "--image", action="append", default=[], metavar="FILE",
+        help=(
+            "Image file to attach to the initial prompt (repeatable). "
+            "The model can see and reason about these images. "
+            "The agent can also call analyze_image() at any time."
+        ),
     )
     parser.add_argument(
         "--model", default=DEFAULT_MODEL,
@@ -537,29 +711,31 @@ def main():
     )
     parser.add_argument(
         "--once", action="store_true",
-        help="Run exactly one iteration then exit",
+        help="Run exactly one iteration then exit (shorthand for --max-iterations 1)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Print the full prompt and exit without running Copilot",
+        help="Print the full prompt and exit without running the agent",
     )
     parser.add_argument(
-        "--idle-timeout", type=int, default=DEFAULT_IDLE_TIMEOUT, metavar="SECONDS",
-        help=f"Kill if no output for this many seconds (default: {DEFAULT_IDLE_TIMEOUT}, 0=disabled)",
-    )
-    parser.add_argument(
-        "--iteration-timeout", type=int, default=DEFAULT_ITERATION_TIMEOUT, metavar="SECONDS",
-        help=f"Max seconds per iteration (default: {DEFAULT_ITERATION_TIMEOUT}, 0=disabled)",
+        "--iteration-timeout", type=int, default=DEFAULT_ITERATION_TIMEOUT,
+        metavar="SECONDS",
+        help=(
+            f"Max seconds per iteration before aborting "
+            f"(default: {DEFAULT_ITERATION_TIMEOUT}, 0=disabled)"
+        ),
     )
 
     args = parser.parse_args()
 
-    # Load config, set env vars, install/verify dependencies
-    run_setup()
+    # Load config, verify Python version, install/verify SDK
+    cfg = run_setup()
+    github_token: str = cfg.get("github_token", "")
 
-    # Resolve dirs
+    # Resolve directories
     work_dir = Path(args.dir[0]).resolve() if args.dir else Path.cwd().resolve()
     extra_dirs = [Path(d).resolve() for d in args.dir[1:]]
+    image_paths = [Path(p).resolve() for p in args.image]
 
     prompt_path = Path(args.prompt).resolve()
     user_prompt = load_prompt(prompt_path)
@@ -567,33 +743,31 @@ def main():
     if args.once:
         args.max_iterations = 1
 
-    # Dry run
+    # Dry run — print prompt and exit
     if args.dry_run:
         scratchpad = load_scratchpad(work_dir)
-        full = build_full_prompt(user_prompt, iteration=1, scratchpad=scratchpad)
+        full = build_full_prompt(
+            user_prompt, iteration=1, scratchpad=scratchpad,
+            work_dir=work_dir, extra_dirs=extra_dirs,
+        )
         print(full)
         sys.exit(0)
-
-    # Verify gh CLI
-    copilot_cli = shutil.which("gh")
-    if not copilot_cli:
-        print("WARNING: 'gh' not found on PATH; will try anyway.")
-        copilot_cli = "gh"
 
     # Init logging
     log_dir = work_dir / "logs"
     log_path = init_log(log_dir)
     init_internal_logs()
 
-    print(f"Prompt:        {prompt_path}")
-    print(f"Working dir:   {work_dir}")
-    print(f"Extra dirs:    {extra_dirs or '(none)'}")
-    print(f"Model:         {args.model}")
-    print(f"Delay:         {args.delay}s")
-    print(f"Idle timeout:  {args.idle_timeout}s")
-    print(f"Iter timeout:  {args.iteration_timeout}s")
-    print(f"Max iters:     {args.max_iterations or 'unlimited'}")
-    print(f"Log file:      {log_path}")
+    print(f"Prompt:          {prompt_path}")
+    print(f"Working dir:     {work_dir}")
+    print(f"Extra dirs:      {extra_dirs or '(none)'}")
+    if image_paths:
+        print(f"Images:          {[str(p) for p in image_paths]}")
+    print(f"Model:           {args.model}")
+    print(f"Delay:           {args.delay}s")
+    print(f"Iter timeout:    {args.iteration_timeout}s")
+    print(f"Max iters:       {args.max_iterations or 'unlimited'}")
+    print(f"Log file:        {log_path}")
     print()
 
     log(f"Prompt file: {prompt_path}")
@@ -615,26 +789,29 @@ def main():
             if args.max_iterations and iteration > args.max_iterations:
                 break
 
-            # Re-read prompt each iteration so the user can edit it live
+            # Re-read prompt each iteration so the user can steer mid-flight
             user_prompt = load_prompt(prompt_path)
             scratchpad = load_scratchpad(work_dir)
-            full_prompt = build_full_prompt(user_prompt, iteration, scratchpad)
+            full_prompt = build_full_prompt(
+                user_prompt, iteration, scratchpad, work_dir, extra_dirs
+            )
 
             commit_before = git_head(work_dir)
 
-            run_copilot(
+            # Images are only attached on the first iteration
+            current_images = image_paths if iteration == 1 else []
+
+            await run_agent(
                 full_prompt,
-                copilot_cli=copilot_cli,
+                github_token=github_token,
                 model=args.model,
                 work_dir=work_dir,
-                extra_dirs=extra_dirs,
                 iteration=iteration,
-                idle_timeout=args.idle_timeout,
+                image_paths=current_images,
                 iteration_timeout=args.iteration_timeout,
             )
 
-            # Report commit status (must run before done-signal check
-            # so commits are always logged, even on the final iteration)
+            # Track commits made during this iteration
             commit_after = git_head(work_dir)
             if commit_after and commit_before != commit_after:
                 msg = f"Agent committed (HEAD now {commit_after[:8]})"
@@ -649,19 +826,19 @@ def main():
             else:
                 log("No commit and no uncommitted changes this iteration.")
 
-            # Check for early-exit signal
+            # Check for early-exit signal from the agent
             if check_done_signal(work_dir):
                 msg = "Agent signalled TASK COMPLETE — stopping."
                 print(f"\n>> {msg}")
                 log(msg)
                 break
 
-            # Delay before next iteration
+            # Delay before next iteration (skip after last iteration)
             is_last = args.max_iterations and iteration >= args.max_iterations
             if not is_last and args.delay > 0:
-                print(f"\nWaiting {args.delay}s before next iteration...")
-                log(f"Waiting {args.delay}s...")
-                time.sleep(args.delay)
+                print(f"\nWaiting {args.delay}s before next iteration…")
+                log(f"Waiting {args.delay}s…")
+                await asyncio.sleep(args.delay)
 
     except KeyboardInterrupt:
         print("\n\nStopped by user (Ctrl-C).")
@@ -673,6 +850,10 @@ def main():
         print(f"Log: {log_path}")
         print("=" * 60)
         close_log()
+
+
+def main() -> None:
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
