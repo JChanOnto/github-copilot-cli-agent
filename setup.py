@@ -1,6 +1,6 @@
 """
-setup.py - Configuration loading, dependency verification, and SDK installation
-           for CoderAgent.
+setup.py - Configuration loading, dependency verification, and Copilot CLI
+           installation for CoderAgent.
 
 Called automatically by agent.py at startup.  Can also be run standalone:
 
@@ -10,11 +10,10 @@ Checks performed
 ----------------
 1. Python 3.10+ version requirement.
 2. CoderAgentConfig.yaml exists and contains a valid GitHub token.
-3. Required Python packages are installed (auto-installs via pip if missing).
+3. GitHub Copilot CLI binary is installed (auto-installs via npm/winget if missing).
 4. git is available on PATH (auto-installs via system package manager if missing).
 """
 
-import importlib
 import os
 import re
 import subprocess
@@ -36,19 +35,11 @@ _PLACEHOLDER = "XXXXXXXXXXXXXXXXXX"
 _MIN_PYTHON = (3, 10)
 
 # ---------------------------------------------------------------------------
-# Required Python packages
-# Each entry: (import_name, pip_install_name, minimum_version_str | None)
-# ---------------------------------------------------------------------------
-_REQUIRED_PACKAGES: list[tuple[str, str, str | None]] = [
-    ("copilot", "github-copilot-sdk", None),
-    ("pydantic", "pydantic", "2.0.0"),
-]
-
-# ---------------------------------------------------------------------------
 # Required system tools
 # ---------------------------------------------------------------------------
 _REQUIRED_SYSTEM_TOOLS: list[tuple[str, str]] = [
     ("git", "Git version control"),
+    ("copilot", "GitHub Copilot CLI"),
 ]
 
 
@@ -132,86 +123,12 @@ def load_config() -> dict[str, str]:
             "  Generate one at: "
             "https://github.com/settings/personal-access-tokens/new"
         )
-        print("  Required: Account permissions → GitHub Copilot → Read-only")
+        print("  Required: Copilot Requests permission")
         print(f"  Update:   {CONFIG_FILE}")
         print("=" * 60)
         sys.exit(1)
 
     return cfg
-
-
-# ---------------------------------------------------------------------------
-# Python package management
-# ---------------------------------------------------------------------------
-
-def _version_tuple(ver_str: str) -> tuple[int, ...]:
-    """Convert a version string like '2.1.3' to a comparable 3-tuple (major, minor, patch)."""
-    try:
-        parts = [int(x) for x in ver_str.split(".")[:3]]
-        # Pad to always have exactly 3 elements so comparisons are consistent
-        while len(parts) < 3:
-            parts.append(0)
-        return tuple(parts)
-    except (ValueError, AttributeError):
-        return (0, 0, 0)
-
-
-def ensure_python_packages() -> None:
-    """Check that required Python packages are installed.
-
-    Packages that are missing or below the minimum version are installed
-    automatically using pip.
-    """
-    needs_install: list[str] = []
-
-    for import_name, pip_name, min_ver in _REQUIRED_PACKAGES:
-        try:
-            mod = importlib.import_module(import_name)
-            if min_ver:
-                installed_ver = getattr(mod, "__version__", None)
-                if installed_ver and (
-                    _version_tuple(installed_ver) < _version_tuple(min_ver)
-                ):
-                    needs_install.append(f"{pip_name}>={min_ver}")
-                    print(
-                        f"  {pip_name}: version {installed_ver} installed, "
-                        f"{min_ver}+ required — will upgrade."
-                    )
-        except ImportError:
-            req = f"{pip_name}>={min_ver}" if min_ver else pip_name
-            needs_install.append(req)
-
-    if not needs_install:
-        return
-
-    print("Installing missing Python packages…")
-    for req in needs_install:
-        print(f"  pip install {req}")
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", req],
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-            if result.returncode != 0:
-                err = result.stderr.strip() or result.stdout.strip()
-                print(
-                    f"ERROR: pip install {req} failed:\n{err}",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-        except subprocess.TimeoutExpired:
-            print(
-                f"ERROR: pip install {req} timed out after 180 s.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(f"ERROR: pip install failed: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-    print("  Python packages ready.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +149,22 @@ _SYSTEM_INSTALL_SPECS: dict[str, dict[str, list[tuple[str, list]]]] = {
                 ],
             )
         ],
+        "copilot": [
+            (
+                "winget",
+                [
+                    [
+                        "winget", "install", "--id", "GitHub.Copilot", "-e",
+                        "--accept-source-agreements",
+                        "--accept-package-agreements",
+                    ]
+                ],
+            ),
+            (
+                "npm",
+                [["npm", "install", "-g", "@github/copilot"]],
+            ),
+        ],
     },
     "Linux": {
         "git": [
@@ -242,31 +175,33 @@ _SYSTEM_INSTALL_SPECS: dict[str, dict[str, list[tuple[str, list]]]] = {
                     ["sudo", "apt-get", "install", "-y", "git"],
                 ],
             ),
-            (
-                "apt-get",
-                [
-                    ["apt-get", "update"],
-                    ["apt-get", "install", "-y", "git"],
-                ],
-            ),
             ("dnf", [["sudo", "dnf", "install", "-y", "git"]]),
             ("pacman", [["sudo", "pacman", "-S", "--noconfirm", "git"]]),
+        ],
+        "copilot": [
+            (
+                "npm",
+                [["npm", "install", "-g", "@github/copilot"]],
+            ),
         ],
     },
     "Darwin": {
         "git": [
             ("brew", [["brew", "install", "git"]]),
-            ("port", [["sudo", "port", "install", "git"]]),
+        ],
+        "copilot": [
+            ("brew", [["brew", "install", "copilot-cli"]]),
+            (
+                "npm",
+                [["npm", "install", "-g", "@github/copilot"]],
+            ),
         ],
     },
 }
 
 
 def _run_install_steps(steps: list, name: str) -> bool:
-    """Execute a sequence of install commands.  Returns True only if all succeed.
-
-    Each step is either a list[str] (direct command) or a str (shell command).
-    """
+    """Execute a sequence of install commands.  Returns True only if all succeed."""
     for step in steps:
         if isinstance(step, str):
             print(f"  Running: {step}")
@@ -366,13 +301,12 @@ def ensure_system_tools() -> None:
 # ---------------------------------------------------------------------------
 
 def run_setup() -> dict[str, str]:
-    """Full startup check: Python version → config → packages → system tools.
+    """Full startup check: Python version → config → system tools.
 
     Returns the loaded config dict (contains github_token and any other keys).
     """
     check_python_version()
     cfg = load_config()
-    ensure_python_packages()
     ensure_system_tools()
     return cfg
 

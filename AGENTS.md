@@ -24,28 +24,27 @@ Follow this loop for every feature or change:
 
 Do not skip steps. Small, frequent iterations catch problems early and keep progress visible.
 
-## 3. API Documentation
+## 3. Documentation
 
 - **Write all documentation in Markdown.** Design docs, API references, guides, and READMEs must be `.md` files committed to the repo. Do not produce Word, PDF, or other binary document formats.
-- Every public function and class must have a docstring explaining its purpose, parameters, return value, and any exceptions raised.
-- When adding or modifying tools (in `tools.py`), update the tool description strings — these are the model's only way to understand what the tool does.
+- Every public function must have a docstring explaining its purpose, parameters, return value, and any exceptions raised.
 - Keep the module-level docstring in each file up to date with a summary of what the file contains.
 - **Include Mermaid diagrams** in documentation where they clarify architecture, data flow, or component relationships. Diagrams are version-controlled and render natively on GitHub.
 
 ## 4. Testing
 
-- **Add unit tests after adding features.** Every new function or tool should have corresponding tests.
+- **Add unit tests after adding features.** Every new function should have corresponding tests.
 - **Test edge cases.** Empty inputs, missing files, timeouts, malformed data.
 - **Run the full test suite before committing.** Do not commit code that breaks existing tests.
-- **Keep tests fast.** Mock external dependencies (network, file I/O, SDK calls) so tests run in seconds, not minutes.
-- Place tests in a `tests/` directory, mirroring the source structure (e.g., `tests/test_tools.py` for `tools.py`).
+- **Keep tests fast.** Mock external dependencies (network, file I/O, subprocess calls) so tests run in seconds, not minutes.
+- Place tests in a `tests/` directory, mirroring the source structure (e.g., `tests/test_agent.py` for `agent.py`).
 
 ## 5. Code Organization & Modularity
 
-- **One concern per file.** Custom tools live in `tools.py`. Setup/config logic lives in `setup.py`. The main agent loop lives in `agent.py`.
-- **Add new tools to `tools.py`**, not inline in `agent.py`. Each tool should be self-contained with its own parameter model and implementation.
-- **Avoid circular imports.** Keep dependency flow one-directional: `agent.py` → `tools.py` → SDK.
+- **One concern per file.** Setup/config logic lives in `setup.py`. The main agent loop lives in `agent.py`.
+- **Avoid circular imports.** Keep dependency flow one-directional: `agent.py` → `setup.py`.
 - **Extract shared utilities** into a `utils.py` if helpers are used across multiple files.
+- The Copilot CLI handles all tooling natively — no custom tool implementations needed.
 
 ## 6. Commit Practices
 
@@ -55,15 +54,15 @@ Do not skip steps. Small, frequent iterations catch problems early and keep prog
 
 ## 7. Error Handling
 
-- Validate inputs at system boundaries (CLI args, tool parameters, file reads).
-- Return meaningful error messages from tools — the model needs to understand what went wrong.
+- Validate inputs at system boundaries (CLI args, config file reads).
+- Return meaningful error messages — the user needs to understand what went wrong.
 - Do not swallow exceptions silently. Log them, then return or re-raise as appropriate.
 
 ## 8. Security
 
 - **Never hardcode tokens or secrets.** Use environment variables or config files excluded from version control.
-- **Validate file paths** to prevent path traversal when tools accept user-provided paths.
-- **Sanitize inputs** to any tool that executes commands or accesses the filesystem.
+- **Validate file paths** to prevent path traversal.
+- The GitHub token is passed as `GITHUB_TOKEN` env var to the Copilot CLI subprocess — never logged or printed.
 
 ## 9. Configuration
 

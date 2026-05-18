@@ -17,9 +17,12 @@
 #     1. Go to https://github.com/settings/personal-access-tokens/new
 #     2. Give it a name, e.g. "CoderAgent"
 #     3. Set an expiration date
-#     4. Under "Account permissions" enable:
-#          GitHub Copilot → Read-only
+#     4. Under "Permissions" click "add permissions" and select:
+#          Copilot Requests
 #     5. Click "Generate token" and paste it below
+#
+#   This token is also set as GITHUB_TOKEN env var when launching
+#   the Copilot CLI, so you don't need to authenticate separately.
 
 github_token: XXXXXXXXXXXXXXXXXX
 

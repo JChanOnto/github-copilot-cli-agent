@@ -3,6 +3,9 @@
      Write your task here. The agent will read this file at the start
      of every iteration, so you can edit it while the agent is running
      to steer its behavior.
+
+     The Copilot CLI has built-in tools for reading/writing files,
+     running shell commands, image analysis, and more.
      ================================================================ -->
 
 ## Goal
