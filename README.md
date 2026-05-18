@@ -13,13 +13,12 @@ You describe a task in a Markdown file.  The agent reads your instructions, laun
 3. [Requirements](#requirements)
 4. [Quick Start](#quick-start)
 5. [Configuration](#configuration)
-6. [How it works](#how-it-works)
-7. [Tooling capabilities](#tooling-capabilities)
-8. [CLI reference](#cli-reference)
-9. [Writing effective prompts](#writing-effective-prompts)
-10. [Platform support](#platform-support)
-11. [Logs](#logs)
-12. [Troubleshooting](#troubleshooting)
+6. [Tooling capabilities](#tooling-capabilities)
+7. [CLI reference](#cli-reference)
+8. [Writing effective prompts](#writing-effective-prompts)
+9. [Platform support](#platform-support)
+10. [Logs](#logs)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -110,31 +109,6 @@ All runtime configuration lives in `CoderAgentConfig.yaml` (created on first run
 | `github_token` | Yes | Your Fine-Grained PAT (`github_pat_…`) with Copilot Requests permission |
 
 The token is exported as `GITHUB_TOKEN` when launching the Copilot CLI, so authentication is handled automatically.
-
----
-
-## How it works
-
-```
-┌────────────────────────────────────────────┐
-│  agent.py (Python loop)                    │
-│                                            │
-│  1. Read prompt.md                         │
-│  2. Build full prompt with context         │
-│  3. Launch: copilot --model <model>        │
-│     (stdin = full prompt)                  │
-│  4. Wait for copilot CLI to exit           │
-│  5. Check git for new commits              │
-│  6. Sleep --delay seconds                  │
-│  7. Repeat from step 1                     │
-└────────────────────────────────────────────┘
-```
-
-The Copilot CLI itself handles all agentic capabilities:
-- Reading and writing files
-- Running shell commands
-- Image/vision analysis (built-in for vision-capable models)
-- MCP server extensibility
 
 ---
 
